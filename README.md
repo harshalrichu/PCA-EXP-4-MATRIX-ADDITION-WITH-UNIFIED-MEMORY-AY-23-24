@@ -39,10 +39,402 @@ Allocate Host Memory
 22.	Reset the device using cudaDeviceReset and return from the main function.
 
 ## PROGRAM:
-TYPE YOUR CODE HERE
+```
+%%writefile unifmem1.cu
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <sys/time.h>
+
+#ifndef _COMMON_H
+#define _COMMON_H
+
+#define CHECK(call)                                                            \
+{                                                                              \
+    const cudaError_t error = call;                                            \
+    if (error != cudaSuccess)                                                  \
+    {                                                                          \
+        fprintf(stderr, "Error: %s:%d, ", __FILE__, __LINE__);                 \
+        fprintf(stderr, "code: %d, reason: %s\n", error,                       \
+                cudaGetErrorString(error));                                    \
+        exit(1);                                                               \
+    }                                                                          \
+}
+
+inline double seconds()
+{
+    struct timeval tp;
+    struct timezone tzp;
+    int i = gettimeofday(&tp, &tzp);
+    return ((double)tp.tv_sec + (double)tp.tv_usec * 1.e-6);
+}
+
+#endif
+
+void initialData(float *ip, const int size)
+{
+    for (int i = 0; i < size; i++)
+    {
+        ip[i] = (float)(rand() & 0xFF) / 10.0f;
+    }
+}
+
+void sumMatrixOnHost(float *A, float *B, float *C,
+                     const int nx, const int ny)
+{
+    for (int iy = 0; iy < ny; iy++)
+    {
+        for (int ix = 0; ix < nx; ix++)
+        {
+            C[iy * nx + ix] = A[iy * nx + ix] + B[iy * nx + ix];
+        }
+    }
+}
+
+void checkResult(float *hostRef, float *gpuRef, const int N)
+{
+    double epsilon = 1.0E-8;
+    bool match = true;
+
+    for (int i = 0; i < N; i++)
+    {
+        if (fabs(hostRef[i] - gpuRef[i]) > epsilon)
+        {
+            match = false;
+            printf("host %f gpu %f\n", hostRef[i], gpuRef[i]);
+            break;
+        }
+    }
+
+    if (match)
+        printf("Arrays match.\n");
+    else
+        printf("Arrays do not match.\n");
+}
+
+// 2D grid, 2D block
+__global__ void sumMatrixGPU(float *MatA, float *MatB, float *MatC,
+                             int nx, int ny)
+{
+    unsigned int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int iy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (ix < nx && iy < ny)
+    {
+        unsigned int idx = iy * nx + ix;
+        MatC[idx] = MatA[idx] + MatB[idx];
+    }
+}
+
+int main(int argc, char **argv)
+{
+    printf("%s Starting ", argv[0]);
+
+    // Set up device
+    int dev = 0;
+    cudaDeviceProp deviceProp;
+
+    CHECK(cudaGetDeviceProperties(&deviceProp, dev));
+
+    printf("using Device %d: %s\n", dev, deviceProp.name);
+
+    CHECK(cudaSetDevice(dev));
+
+    // Matrix size
+    int nx, ny;
+    int ishift = 12;
+
+    if (argc > 1)
+        ishift = atoi(argv[1]);
+
+    nx = ny = 1 << ishift;
+
+    int nxy = nx * ny;
+    int nBytes = nxy * sizeof(float);
+
+    printf("Matrix size: nx %d ny %d\n", nx, ny);
+
+    // Unified Memory allocation
+    float *A, *B, *hostRef, *gpuRef;
+
+    CHECK(cudaMallocManaged((void **)&A, nBytes));
+    CHECK(cudaMallocManaged((void **)&B, nBytes));
+    CHECK(cudaMallocManaged((void **)&gpuRef, nBytes));
+    CHECK(cudaMallocManaged((void **)&hostRef, nBytes));
+
+    // Initialize data
+    double iStart = seconds();
+
+    initialData(A, nxy);
+    initialData(B, nxy);
+
+    double iElaps = seconds() - iStart;
+
+    printf("initialization: \t %f sec\n", iElaps);
+
+    memset(hostRef, 0, nBytes);
+    memset(gpuRef, 0, nBytes);
+
+    // Host matrix addition
+    iStart = seconds();
+
+    sumMatrixOnHost(A, B, hostRef, nx, ny);
+
+    iElaps = seconds() - iStart;
+
+    printf("sumMatrix on host:\t %f sec\n", iElaps);
+
+    // Configure kernel
+    int dimx = 32;
+    int dimy = 32;
+
+    dim3 block(dimx, dimy);
+    dim3 grid(
+        (nx + block.x - 1) / block.x,
+        (ny + block.y - 1) / block.y
+    );
+
+    // Warm-up kernel
+    sumMatrixGPU<<<grid, block>>>(A, B, gpuRef, 1, 1);
+
+    CHECK(cudaDeviceSynchronize());
+
+    // GPU matrix addition
+    iStart = seconds();
+
+    sumMatrixGPU<<<grid, block>>>(A, B, gpuRef, nx, ny);
+
+    CHECK(cudaDeviceSynchronize());
+
+    iElaps = seconds() - iStart;
+
+    printf("sumMatrix on gpu :\t %f sec <<<(%d,%d), (%d,%d)>>> \n",
+           iElaps,
+           grid.x, grid.y,
+           block.x, block.y);
+
+    // Check kernel error
+    CHECK(cudaGetLastError());
+
+    // Check result
+    checkResult(hostRef, gpuRef, nxy);
+
+    // Free Unified Memory
+    CHECK(cudaFree(A));
+    CHECK(cudaFree(B));
+    CHECK(cudaFree(hostRef));
+    CHECK(cudaFree(gpuRef));
+
+    // Reset device
+    CHECK(cudaDeviceReset());
+
+    return 0;
+}
+%%writefile unifmem2.cu
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <sys/time.h>
+
+#ifndef _COMMON_H
+#define _COMMON_H
+
+#define CHECK(call)                                                            \
+{                                                                              \
+    const cudaError_t error = call;                                            \
+    if (error != cudaSuccess)                                                  \
+    {                                                                          \
+        fprintf(stderr, "Error: %s:%d, ", __FILE__, __LINE__);                 \
+        fprintf(stderr, "code: %d, reason: %s\n", error,                       \
+                cudaGetErrorString(error));                                    \
+        exit(1);                                                               \
+    }                                                                          \
+}
+
+inline double seconds()
+{
+    struct timeval tp;
+    struct timezone tzp;
+    int i = gettimeofday(&tp, &tzp);
+    return ((double)tp.tv_sec + (double)tp.tv_usec * 1.e-6);
+}
+
+#endif
+
+void initialData(float *ip, const int size)
+{
+    for (int i = 0; i < size; i++)
+    {
+        ip[i] = (float)(rand() & 0xFF) / 10.0f;
+    }
+}
+
+void sumMatrixOnHost(float *A, float *B, float *C,
+                     const int nx, const int ny)
+{
+    for (int iy = 0; iy < ny; iy++)
+    {
+        for (int ix = 0; ix < nx; ix++)
+        {
+            C[iy * nx + ix] = A[iy * nx + ix] + B[iy * nx + ix];
+        }
+    }
+}
+
+void checkResult(float *hostRef, float *gpuRef, const int N)
+{
+    double epsilon = 1.0E-8;
+    bool match = true;
+
+    for (int i = 0; i < N; i++)
+    {
+        if (fabs(hostRef[i] - gpuRef[i]) > epsilon)
+        {
+            match = false;
+            printf("host %f gpu %f\n", hostRef[i], gpuRef[i]);
+            break;
+        }
+    }
+
+    if (match)
+        printf("Arrays match.\n");
+    else
+        printf("Arrays do not match.\n");
+}
+
+// 2D grid, 2D block
+__global__ void sumMatrixGPU(float *MatA, float *MatB, float *MatC,
+                             int nx, int ny)
+{
+    unsigned int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int iy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (ix < nx && iy < ny)
+    {
+        unsigned int idx = iy * nx + ix;
+        MatC[idx] = MatA[idx] + MatB[idx];
+    }
+}
+
+int main(int argc, char **argv)
+{
+    printf("%s Starting ", argv[0]);
+
+    // Set up device
+    int dev = 0;
+    cudaDeviceProp deviceProp;
+
+    CHECK(cudaGetDeviceProperties(&deviceProp, dev));
+
+    printf("using Device %d: %s\n", dev, deviceProp.name);
+
+    CHECK(cudaSetDevice(dev));
+
+    // Matrix size
+    int nx, ny;
+    int ishift = 12;
+
+    if (argc > 1)
+        ishift = atoi(argv[1]);
+
+    nx = ny = 1 << ishift;
+
+    int nxy = nx * ny;
+    int nBytes = nxy * sizeof(float);
+
+    printf("Matrix size: nx %d ny %d\n", nx, ny);
+
+    // Unified Memory allocation
+    float *A, *B, *hostRef, *gpuRef;
+
+    CHECK(cudaMallocManaged((void **)&A, nBytes));
+    CHECK(cudaMallocManaged((void **)&B, nBytes));
+    CHECK(cudaMallocManaged((void **)&gpuRef, nBytes));
+    CHECK(cudaMallocManaged((void **)&hostRef, nBytes));
+
+    // Initialize data
+    double iStart = seconds();
+
+    initialData(A, nxy);
+    initialData(B, nxy);
+
+    double iElaps = seconds() - iStart;
+
+    printf("initialization: \t %f sec\n", iElaps);
+
+
+
+    // Host matrix addition
+    iStart = seconds();
+
+    sumMatrixOnHost(A, B, hostRef, nx, ny);
+
+    iElaps = seconds() - iStart;
+
+    printf("sumMatrix on host:\t %f sec\n", iElaps);
+
+    // Configure kernel
+    int dimx = 32;
+    int dimy = 32;
+
+    dim3 block(dimx, dimy);
+    dim3 grid(
+        (nx + block.x - 1) / block.x,
+        (ny + block.y - 1) / block.y
+    );
+
+    // Warm-up kernel
+    sumMatrixGPU<<<grid, block>>>(A, B, gpuRef, 1, 1);
+
+    CHECK(cudaDeviceSynchronize());
+
+    // GPU matrix addition
+    iStart = seconds();
+
+    sumMatrixGPU<<<grid, block>>>(A, B, gpuRef, nx, ny);
+
+    CHECK(cudaDeviceSynchronize());
+
+    iElaps = seconds() - iStart;
+
+    printf("sumMatrix on gpu :\t %f sec <<<(%d,%d), (%d,%d)>>> \n",
+           iElaps,
+           grid.x, grid.y,
+           block.x, block.y);
+
+    // Check kernel error
+    CHECK(cudaGetLastError());
+
+    // Check result
+    checkResult(hostRef, gpuRef, nxy);
+
+    // Free Unified Memory
+    CHECK(cudaFree(A));
+    CHECK(cudaFree(B));
+    CHECK(cudaFree(hostRef));
+    CHECK(cudaFree(gpuRef));
+
+    // Reset device
+    CHECK(cudaDeviceReset());
+
+    return 0;
+}
+```
+
+
 
 ## OUTPUT:
-SHOW YOUR OUTPUT HERE
+<img width="1245" height="846" alt="image" src="https://github.com/user-attachments/assets/5814a1f6-e92b-475f-bcf4-a5844ec0a2ed" />
+
+<img width="1193" height="775" alt="image" src="https://github.com/user-attachments/assets/2ccf4345-94dd-4c76-9bf1-ec391a7684e4" />
+
+
 
 ## RESULT:
 Thus the program has been executed by using unified memory. It is observed that removing memset function has given less/more_______________time.
